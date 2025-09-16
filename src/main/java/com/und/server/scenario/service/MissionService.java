@@ -4,25 +4,30 @@ import java.time.Clock;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.und.server.common.exception.ServerException;
 import com.und.server.scenario.constants.MissionSearchType;
 import com.und.server.scenario.constants.MissionType;
+import com.und.server.scenario.dto.MissionUpdatePlanDto;
 import com.und.server.scenario.dto.request.BasicMissionRequest;
 import com.und.server.scenario.dto.request.TodayMissionRequest;
 import com.und.server.scenario.dto.response.MissionGroupResponse;
 import com.und.server.scenario.dto.response.MissionResponse;
 import com.und.server.scenario.entity.Mission;
 import com.und.server.scenario.entity.Scenario;
+import com.und.server.scenario.event.publisher.ScenarioEventPublisher;
 import com.und.server.scenario.exception.ScenarioErrorResult;
 import com.und.server.scenario.repository.MissionRepository;
+import com.und.server.scenario.repository.ScenarioRepository;
 import com.und.server.scenario.util.MissionTypeGroupSorter;
 import com.und.server.scenario.util.MissionValidator;
 import com.und.server.scenario.util.OrderCalculator;
@@ -34,20 +39,28 @@ import lombok.RequiredArgsConstructor;
 @RequiredArgsConstructor
 public class MissionService {
 
+	private static final String ZONE_ID = "Asia/Seoul";
 	private final MissionRepository missionRepository;
+	private final ScenarioRepository scenarioRepository;
 	private final MissionTypeGroupSorter missionTypeGroupSorter;
+	private final OrderCalculator orderCalculator;
 	private final ScenarioValidator scenarioValidator;
 	private final MissionValidator missionValidator;
+	private final ScenarioEventPublisher scenarioEventPublisher;
 	private final Clock clock;
 
 
 	@Transactional(readOnly = true)
+	@Cacheable(
+		value = "missions", key = "#memberId + ':' + #scenarioId + ':' + #date",
+		cacheManager = "scenarioCacheManager"
+	)
 	public MissionGroupResponse findMissionsByScenarioId(
 		final Long memberId, final Long scenarioId, final LocalDate date
 	) {
 		scenarioValidator.validateScenarioExists(scenarioId);
 
-		LocalDate today = LocalDate.now(clock.withZone(ZoneId.of("Asia/Seoul")));
+		LocalDate today = LocalDate.now(clock.withZone(ZoneId.of(ZONE_ID)));
 		MissionSearchType missionSearchType = MissionSearchType.getMissionSearchType(today, date);
 
 		List<Mission> missions = getMissionsByDate(missionSearchType, memberId, scenarioId, date);
@@ -76,11 +89,10 @@ public class MissionService {
 		}
 
 		List<Mission> missions = new ArrayList<>();
+		List<Integer> orders = orderCalculator.generateMissionOrders(missionRequests.size());
 
-		int order = OrderCalculator.START_ORDER;
-		for (BasicMissionRequest missionInfo : missionRequests) {
-			missions.add(missionInfo.toEntity(scenario, order));
-			order += OrderCalculator.DEFAULT_ORDER;
+		for (int i = 0; i < missionRequests.size(); i++) {
+			missions.add(missionRequests.get(i).toEntity(scenario, orders.get(i)));
 		}
 		missionValidator.validateMaxBasicMissionCount(missions);
 
@@ -90,11 +102,15 @@ public class MissionService {
 
 	@Transactional
 	public MissionResponse addTodayMission(
-		final Scenario scenario,
+		final Long memberId,
+		final Long scenarioId,
 		final TodayMissionRequest todayMissionRequest,
 		final LocalDate date
 	) {
-		LocalDate today = LocalDate.now(clock.withZone(ZoneId.of("Asia/Seoul")));
+		Scenario scenario = scenarioRepository.findTodayScenarioFetchByIdAndMemberId(memberId, scenarioId, date)
+			.orElseThrow(() -> new ServerException(ScenarioErrorResult.NOT_FOUND_SCENARIO));
+
+		LocalDate today = LocalDate.now(clock.withZone(ZoneId.of(ZONE_ID)));
 		missionValidator.validateTodayMissionDateRange(today, date);
 
 		List<Mission> todayMissions = missionTypeGroupSorter.groupAndSortByType(
@@ -104,58 +120,36 @@ public class MissionService {
 		Mission newMission = todayMissionRequest.toEntity(scenario, date);
 		missionRepository.save(newMission);
 
+		scenarioEventPublisher.publishMissionCreateEvent(memberId, scenarioId, date);
 		return MissionResponse.from(newMission);
 	}
 
 
 	@Transactional
-	public void updateBasicMission(final Scenario oldSCenario, final List<BasicMissionRequest> missionRequests) {
-		List<Mission> oldMissions =
-			missionTypeGroupSorter.groupAndSortByType(oldSCenario.getMissions(), MissionType.BASIC);
+	public void updateBasicMission(final Scenario scenario, final List<BasicMissionRequest> missionRequests) {
+		List<Mission> existingMissions =
+			missionTypeGroupSorter.groupAndSortByType(scenario.getMissions(), MissionType.BASIC);
 
 		if (missionRequests.isEmpty()) {
-			oldSCenario.getMissions().removeIf(mission ->
-				mission.getMissionType() == MissionType.BASIC
-			);
+			scenario.getMissions().removeIf(mission -> mission.getMissionType() == MissionType.BASIC);
 			return;
 		}
 
-		Map<Long, Mission> existingMissions = oldMissions.stream()
-			.collect(Collectors.toMap(Mission::getId, mission -> mission));
-		Set<Long> existingMissionIds = existingMissions.keySet();
-		List<Long> requestedMissionIds = new ArrayList<>();
+		MissionUpdatePlanDto updatePlan = createMissionUpdatePlan(scenario, existingMissions, missionRequests);
+		missionValidator.validateMaxBasicMissionCount(updatePlan.missionsToSave());
 
-		List<Mission> toAdd = new ArrayList<>();
+		List<Mission> missionsToSave = updatePlan.missionsToSave();
+		List<Long> missionsToDelete = updatePlan.missionsToDelete();
 
-		int order = OrderCalculator.START_ORDER;
-		for (BasicMissionRequest missionInfo : missionRequests) {
-			Long missionId = missionInfo.missionId();
-
-			if (missionId == null) {
-				toAdd.add(missionInfo.toEntity(oldSCenario, order));
-			} else {
-				Mission existingMission = existingMissions.get(missionId);
-				if (existingMission != null) {
-					existingMission.updateMissionOrder(order);
-					toAdd.add(existingMission);
-					requestedMissionIds.add(missionId);
-				}
-			}
-			order += OrderCalculator.DEFAULT_ORDER;
-		}
-		missionValidator.validateMaxBasicMissionCount(toAdd);
-
-		List<Long> toDeleteId = existingMissionIds.stream()
-			.filter(id -> !requestedMissionIds.contains(id))
-			.toList();
-
-		oldSCenario.getMissions().removeIf(mission ->
+		scenario.getMissions().removeIf(mission ->
 			mission.getMissionType() == MissionType.BASIC
-				&& toDeleteId.contains(mission.getId())
+				&& missionsToDelete.contains(mission.getId())
 		);
 
-		missionRepository.deleteByParentMissionIdIn(toDeleteId);
-		missionRepository.saveAll(toAdd);
+		if (!missionsToDelete.isEmpty()) {
+			missionRepository.deleteByParentMissionIdIn(missionsToDelete);
+		}
+		missionRepository.saveAll(missionsToSave);
 	}
 
 
@@ -170,19 +164,15 @@ public class MissionService {
 			.orElseThrow(() -> new ServerException(ScenarioErrorResult.NOT_FOUND_MISSION));
 
 		MissionSearchType missionSearchType = MissionSearchType.getMissionSearchType(
-			LocalDate.now(clock.withZone(ZoneId.of("Asia/Seoul"))), date);
+			LocalDate.now(clock.withZone(ZoneId.of(ZONE_ID))), date);
 
 		if (mission.getMissionType() == MissionType.BASIC && missionSearchType == MissionSearchType.FUTURE) {
 			updateFutureBasicMission(mission, isChecked, date);
-			return;
+		} else {
+			mission.updateCheckStatus(isChecked);
 		}
-		mission.updateCheckStatus(isChecked);
-	}
 
-
-	@Transactional
-	public void deleteMissions(final Long scenarioId) {
-		missionRepository.deleteByScenarioId(scenarioId);
+		scenarioEventPublisher.publishMissionCheckUpdateEvent(memberId, mission.getScenario().getId(), date);
 	}
 
 
@@ -192,6 +182,8 @@ public class MissionService {
 			.orElseThrow(() -> new ServerException(ScenarioErrorResult.NOT_FOUND_MISSION));
 
 		missionRepository.delete(mission);
+
+		scenarioEventPublisher.publishTodayMissionDeleteEvent(memberId, mission.getScenario().getId());
 	}
 
 
@@ -247,6 +239,45 @@ public class MissionService {
 					}
 				}
 			);
+	}
+
+	private MissionUpdatePlanDto createMissionUpdatePlan(
+		final Scenario scenario,
+		final List<Mission> existingMissions,
+		final List<BasicMissionRequest> missionRequests
+	) {
+		Map<Long, Mission> existingMissionMap = existingMissions.stream()
+			.collect(Collectors.toMap(Mission::getId, mission -> mission));
+
+		List<Integer> newOrders = orderCalculator.generateMissionOrders(missionRequests.size());
+		List<Mission> missionsToSave = new ArrayList<>();
+		Set<Long> requestedMissionIds = new HashSet<>();
+
+		for (int i = 0; i < missionRequests.size(); i++) {
+			BasicMissionRequest request = missionRequests.get(i);
+			Integer newOrder = newOrders.get(i);
+			Long missionId = request.missionId();
+
+			if (missionId == null) {
+				missionsToSave.add(request.toEntity(scenario, newOrder));
+			} else {
+				Mission existingMission = existingMissionMap.get(missionId);
+				if (existingMission != null) {
+					existingMission.updateMissionOrder(newOrder);
+					missionsToSave.add(existingMission);
+					requestedMissionIds.add(missionId);
+				}
+			}
+		}
+
+		List<Long> missionsToDelete = existingMissionMap.keySet().stream()
+			.filter(id -> !requestedMissionIds.contains(id))
+			.toList();
+
+		return MissionUpdatePlanDto.builder()
+			.missionsToSave(missionsToSave)
+			.missionsToDelete(missionsToDelete)
+			.build();
 	}
 
 }
